@@ -69,11 +69,21 @@ class AccountPayment(models.Model):
     @api.depends("use_payment_pro", "main_payment_id")
     def _compute_available_journal_ids(self):
         super()._compute_available_journal_ids()
-        for rec in self.filtered(lambda x: x.main_payment_id or not x.use_payment_pro and x.company_id):
+        for rec in self:
+            if not rec.company_id:
+                continue
+
             bundle_journal_id = rec.company_id._get_bundle_journal(rec.payment_type)
-            rec.available_journal_ids = rec.available_journal_ids.filtered(
-                lambda x: x._origin.id != bundle_journal_id and not x._origin.currency_id
-            )
+            journals = rec.available_journal_ids
+
+            # If it's a linked payment remove bundle journal and journals with currency
+            if rec.main_payment_id:
+                journals = journals.filtered(lambda j: j._origin.id != bundle_journal_id and not j.currency_id)
+            # If company doesn't use Payment Pro just remove bundle journal
+            elif not rec.use_payment_pro:
+                journals = journals.filtered(lambda j: j._origin.id != bundle_journal_id)
+
+            rec.available_journal_ids = journals
 
     @api.depends("main_payment_id.to_pay_move_line_ids")
     def _compute_to_pay_move_lines(self):
@@ -164,24 +174,18 @@ class AccountPayment(models.Model):
         return res
 
     def _bypass_journal_entry(self):
-        return self.filtered(lambda x: x.is_main_payment and not (x.write_off_amount or x.withholdings_amount))
+        # Only main bundle payments (is_main_payment, no main_payment_id) without write-off or withholdings skip journal entry.
+        # Linked payments and regular payments always create journal entries, including write-off.
+        return self.filtered(
+            lambda x: x.is_main_payment and not x.main_payment_id and not (x.write_off_amount or x.withholdings_amount)
+        )
 
     def _generate_journal_entry(self, write_off_line_vals=None, force_balance=None, line_ids=None):
         super(AccountPayment, self - self._bypass_journal_entry())._generate_journal_entry(
-            write_off_line_vals=write_off_line_vals, force_balance=force_balance, line_ids=line_ids
+            write_off_line_vals=write_off_line_vals,
+            force_balance=force_balance,
+            line_ids=line_ids,
         )
-
-    def _prepare_move_line_default_vals(self, write_off_line_vals=None, force_balance=None):
-        res = super()._prepare_move_line_default_vals(write_off_line_vals=None, force_balance=None)
-        if self.payment_method_code == "payment_bundle":
-            bundle_account = self.payment_method_line_id.payment_account_id
-            res = [line for line in res if not (line.get("account_id") == bundle_account.id)]
-            for line in res:
-                if "tax_repartition_line_id" in line:
-                    tax_id = self.env["account.tax.repartition.line"].browse(line["tax_repartition_line_id"]).tax_id
-                    if tax_id.l10n_ar_withholding_payment_type:
-                        line["name"] = tax_id.name
-        return res
 
     @api.depends("partner_id", "amount", "date", "payment_type")
     def _compute_duplicate_payment_ids(self):

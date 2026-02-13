@@ -18,7 +18,13 @@ class AccountPayment(models.Model):
         currency_field="counterpart_currency_id",
         compute="_compute_counterpart_currency_amount",
     )
-    counterpart_currency_id = fields.Many2one("res.currency")
+    counterpart_currency_id = fields.Many2one(
+        "res.currency",
+        compute="_compute_counterpart_currency_id",
+        store=True,
+        readonly=False,
+        precompute=True,
+    )
     counterpart_exchange_rate = fields.Float(
         readonly=False,
         compute="_compute_counterpart_exchange_rate",
@@ -32,7 +38,8 @@ class AccountPayment(models.Model):
     )
     journal_currency_id = fields.Many2one(related="journal_id.currency_id", string="Journal Currency")
     destination_journal_currency_id = fields.Many2one(
-        related="destination_journal_id.currency_id", string="Destination Journal Currency"
+        related="destination_journal_id.currency_id",
+        string="Destination Journal Currency",
     )
     force_amount_company_currency = fields.Monetary(
         string="Forced Amount on Company Currency",
@@ -57,7 +64,9 @@ class AccountPayment(models.Model):
         compute="_compute_amount_company_currency_signed_pro",
     )
     payment_total = fields.Monetary(
-        compute="_compute_payment_total", tracking=True, currency_field="company_currency_id"
+        compute="_compute_payment_total",
+        tracking=True,
+        currency_field="company_currency_id",
     )
     available_journal_ids = fields.Many2many(comodel_name="account.journal", compute="_compute_available_journal_ids")
     # desde account_payment_group, modelo account.payment.group
@@ -123,6 +132,10 @@ class AccountPayment(models.Model):
     use_payment_pro = fields.Boolean(compute="_compute_use_payment_pro")
 
     open_move_line_ids = fields.One2many(related="move_id.open_move_line_ids")
+
+    @api.depends("journal_id")
+    def _compute_counterpart_currency_id(self):
+        self.filtered(lambda x: x.journal_id.currency_id == x.counterpart_currency_id).counterpart_currency_id = False
 
     @api.depends("company_id", "outstanding_account_id")
     def _compute_use_payment_pro(self):
@@ -208,18 +221,24 @@ class AccountPayment(models.Model):
             self.env.company = self.company_id
         super()._compute_available_journal_ids()
 
-    @api.depends("currency_id", "destination_journal_currency_id")
+    @api.depends(
+        "currency_id",
+        "company_currency_id",
+        "is_internal_transfer",
+        "destination_journal_currency_id",
+    )
     def _compute_other_currency(self):
         for rec in self:
-            rec.other_currency = False
-            if rec.company_currency_id and rec.currency_id and rec.company_currency_id != rec.currency_id:
-                rec.other_currency = True
-            elif (
-                rec.is_internal_transfer
-                and rec.destination_journal_currency_id
-                and rec.company_currency_id != rec.destination_journal_currency_id
-            ):
-                rec.other_currency = True
+            company_currency = rec.company_currency_id
+            rec.other_currency = bool(
+                (company_currency and rec.currency_id and company_currency != rec.currency_id)
+                or (
+                    rec.is_internal_transfer
+                    and company_currency
+                    and rec.destination_journal_currency_id
+                    and company_currency != rec.destination_journal_currency_id
+                )
+            )
 
     @api.depends("amount", "other_currency", "amount_company_currency")
     def _compute_exchange_rate(self):
@@ -302,59 +321,52 @@ class AccountPayment(models.Model):
             else:
                 super(AccountPayment, rec)._compute_destination_account_id()
 
-    def _prepare_move_line_default_vals(self, write_off_line_vals=None, force_balance=None):
-        # TODO: elimino los write_off_line_vals  porque los regenero tanto aca
+    def _prepare_move_lines_per_type(self, write_off_line_vals=None, force_balance=None):
+        # TODO: elimino los write_off_line_vals porque los regenero tanto aca
         # como en retenciones. esto puede generar problemas
-        if not self.company_id.use_payment_pro:
-            return super()._prepare_move_line_default_vals(
-                write_off_line_vals=write_off_line_vals, force_balance=force_balance
-            )
-        write_off_line_vals = []
-        if self.write_off_amount:
-            if self.payment_type == "inbound":
-                # Receive money.
-                write_off_amount_currency = self.write_off_amount
-            else:
-                # Send money.
-                write_off_amount_currency = -self.write_off_amount
+        if self.company_id.use_payment_pro:
+            write_off_line_vals = []
+            if self.write_off_amount:
+                amount = self.write_off_amount if self.payment_type == "inbound" else -self.write_off_amount
+                write_off_line_vals.append(
+                    {
+                        "name": self.write_off_type_id.label or self.write_off_type_id.name,
+                        "account_id": self.write_off_type_id.account_id.id,
+                        "partner_id": self.partner_id.id,
+                        "currency_id": self.currency_id.id,
+                        "amount_currency": amount,
+                        "balance": self.currency_id._convert(
+                            amount, self.company_id.currency_id, self.company_id, self.date
+                        ),
+                    }
+                )
 
-            write_off_line_vals.append(
-                {
-                    "name": self.write_off_type_id.label or self.write_off_type_id.name,
-                    "account_id": self.write_off_type_id.account_id.id,
-                    "partner_id": self.partner_id.id,
-                    "currency_id": self.currency_id.id,
-                    "amount_currency": write_off_amount_currency,
-                    "balance": self.currency_id._convert(
-                        write_off_amount_currency, self.company_id.currency_id, self.company_id, self.date
-                    ),
-                }
-            )
-        res = super()._prepare_move_line_default_vals(
-            write_off_line_vals=write_off_line_vals, force_balance=force_balance
-        )
-        if self.force_amount_company_currency:
-            difference = self.force_amount_company_currency - res[0]["credit"] - res[0]["debit"]
-            if res[0]["credit"]:
-                liquidity_field = "credit"
-                counterpart_field = "debit"
-            else:
-                liquidity_field = "debit"
-                counterpart_field = "credit"
-            res[0].update(
-                {
-                    liquidity_field: self.force_amount_company_currency,
-                }
-            )
-            res[1].update(
-                {
-                    counterpart_field: res[1][counterpart_field] + difference,
-                }
-            )
+        res = super()._prepare_move_lines_per_type(write_off_line_vals=write_off_line_vals, force_balance=force_balance)
 
-        if self._use_counterpart_currency():
-            sign = 1 if res[1].get("amount_currency", 1) >= 0 else -1
-            res[1].update(
+        if self.company_id.use_payment_pro and write_off_line_vals and not res.get("write_off_lines"):
+            res["write_off_lines"] = write_off_line_vals
+            w_balance = sum(line["balance"] for line in write_off_line_vals)
+            w_amount_currency = sum(line["amount_currency"] for line in write_off_line_vals)
+            if res.get("counterpart_lines"):
+                res["counterpart_lines"][0]["balance"] -= w_balance
+                res["counterpart_lines"][0]["amount_currency"] -= w_amount_currency
+
+        if not self.company_id.use_payment_pro and not self.is_internal_transfer:
+            return res
+
+        liquidity_lines = res.get("liquidity_lines", [])
+        counterpart_lines = res.get("counterpart_lines", [])
+
+        if self.force_amount_company_currency and liquidity_lines and counterpart_lines:
+            sign = 1 if liquidity_lines[0]["balance"] > 0 else -1
+            new_balance = sign * self.force_amount_company_currency
+            difference = new_balance - liquidity_lines[0]["balance"]
+            liquidity_lines[0]["balance"] = new_balance
+            counterpart_lines[0]["balance"] -= difference
+
+        if self._use_counterpart_currency() and counterpart_lines:
+            sign = 1 if counterpart_lines[0].get("amount_currency", 1) >= 0 else -1
+            counterpart_lines[0].update(
                 {
                     "currency_id": self.counterpart_currency_id.id,
                     "amount_currency": sign * abs(self.counterpart_currency_amount),
@@ -378,7 +390,11 @@ class AccountPayment(models.Model):
         # esto esta ligado de alguna manera a un llamado que se hace dos veces por "culpa" del método
         # "_inverse_amount_company_currency". Si bien no es elegante para todas las pruebas que hicimos funcionó bien.
         if self.mapped("move_id"):
-            res = res + ("force_amount_company_currency", "counterpart_exchange_rate", "counterpart_currency_id")
+            res = res + (
+                "force_amount_company_currency",
+                "counterpart_exchange_rate",
+                "counterpart_currency_id",
+            )
         return res + (
             "write_off_amount",
             "write_off_type_id",
