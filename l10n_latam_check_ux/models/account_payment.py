@@ -9,7 +9,7 @@ class AccountPayment(models.Model):
 
     l10n_latam_move_check_ids_operation_date = fields.Datetime(
         string="Operation Date",
-        default=fields.Datetime.now(),
+        default=fields.Datetime.now,
     )
 
     @api.constrains("l10n_latam_move_check_ids_operation_date", "state")
@@ -40,8 +40,31 @@ class AccountPayment(models.Model):
         for rec in self:
             if rec.l10n_latam_check_warning_msg:
                 raise ValidationError("%s" % rec.l10n_latam_check_warning_msg)
-            rec.l10n_latam_move_check_ids_operation_date = fields.Datetime.now()
+            rec.l10n_latam_move_check_ids_operation_date = rec._get_check_operation_date()
         super().action_post()
+
+    def _get_check_operation_date(self):
+        """Fecha que deja a este pago al final de la cadena de operaciones de sus cheques.
+
+        El orden de la cadena de un cheque —quien es su "ultima operacion"— sale de
+        ``l10n_latam_move_check_ids_operation_date``, y de ahi dependen el diario actual del cheque
+        (``_compute_current_journal``) y el bloqueo para restablecer un pago a borrador
+        (``action_draft``).
+
+        Anclar ese valor a una fecha suelta ordena mal en los dos sentidos: con la fecha de
+        confirmacion, re-confirmar un pago viejo lo manda al final de la cadena; con la fecha de
+        creacion, un borrador creado antes que el resto queda al principio aunque se confirme
+        ultimo, y ahi el cheque entregado sigue figurando en cartera. Por eso partimos de
+        ``create_date`` pero garantizamos que confirmar nunca deje al pago antes de una operacion
+        ya confirmada del mismo cheque.
+        """
+        self.ensure_one()
+        operation_date = self.create_date or fields.Datetime.now()
+        for check in self.l10n_latam_move_check_ids | self.l10n_latam_new_check_ids:
+            last_operation_date = check._get_last_operation().l10n_latam_move_check_ids_operation_date
+            if last_operation_date:
+                operation_date = max(operation_date, last_operation_date + timedelta(seconds=1))
+        return operation_date
 
     def _create_paired_internal_transfer_payment(self):
         """
@@ -57,8 +80,10 @@ class AccountPayment(models.Model):
         # Who already create both payments at once in the _create_payments method.)
         if not self.env.context.get("check_deposit_transfer"):
             third_party_checks = self.filtered(
-                lambda x: x.payment_method_line_id.code
-                in ["in_third_party_checks", "out_third_party_checks", "return_third_party_checks"]
+                lambda x: (
+                    x.payment_method_line_id.code
+                    in ["in_third_party_checks", "out_third_party_checks", "return_third_party_checks"]
+                )
             )
             for rec in third_party_checks:
                 dest_payment_method_code = (
@@ -102,6 +127,24 @@ class AccountPayment(models.Model):
                     rec.paired_internal_transfer_payment_id.payment_method_line_id = correct_dest_payment_method
             super(AccountPayment, self - third_party_checks)._create_paired_internal_transfer_payment()
 
+    def _get_reconciled_checks_error(self):
+        """No bloquear los cheques propios con débito automático.
+
+        Cuando la cuenta del método de pago de cheques propios no es conciliable (típicamente
+        porque es la misma cuenta del diario de liquidez, es decir el banco debita el cheque al
+        emitirlo), el cheque nace en ``debited`` y nunca va a salir de ese estado: no hay
+        conciliación que lo mueva (ver ``l10n_latam.check._compute_issue_state``). La restricción
+        del core existe para no romper la conciliación que debitó o anuló el cheque, así que en
+        este caso no aplica y el pago se puede restablecer a borrador o cancelar.
+        """
+        payments_with_reconciled_checks = self.filtered(
+            lambda payment: payment.l10n_latam_new_check_ids.filtered(
+                lambda check: check.issue_state in ("debited", "voided")
+                and check.outstanding_line_id.account_id.reconcile
+            )
+        )
+        return super(AccountPayment, payments_with_reconciled_checks)._get_reconciled_checks_error()
+
     def action_draft(self):
         for rec in self:
             for check in rec.mapped("l10n_latam_move_check_ids") + rec.mapped("l10n_latam_new_check_ids"):
@@ -112,3 +155,43 @@ class AccountPayment(models.Model):
                     )
 
         super().action_draft()
+
+    def _is_latam_check_transfer(self):
+        self.ensure_one()
+        return super()._is_latam_check_transfer() or (
+            self.is_internal_transfer
+            and bool(self.l10n_latam_move_check_ids)
+            and self.destination_account_id == self.company_id.transfer_account_id
+        )
+
+    @api.constrains(
+        "is_internal_transfer",
+        "payment_type",
+        "payment_method_line_id",
+        "destination_journal_id",
+        "l10n_latam_move_check_ids",
+    )
+    def _check_inbound_transfer_checks_current_journal(self):
+        """Keep server-side behavior aligned with the wizard domain in Odoo.
+
+        For inbound internal transfers receiving third-party checks, all selected checks
+        must come from the same current journal: the source journal (`destination_journal_id`).
+        """
+        for rec in self.filtered(
+            lambda x: (
+                x.state == "draft"
+                and x.is_internal_transfer
+                and x.payment_type == "inbound"
+                and x.payment_method_line_id.code == "in_third_party_checks"
+                and x.destination_journal_id
+                and x.l10n_latam_move_check_ids
+            )
+        ):
+            invalid_checks = rec.l10n_latam_move_check_ids.filtered(
+                lambda c: c.current_journal_id and c.current_journal_id != rec.destination_journal_id
+            )
+            if invalid_checks:
+                raise ValidationError(
+                    "All selected checks must belong to the source journal (%s)."
+                    % rec.destination_journal_id.display_name
+                )

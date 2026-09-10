@@ -8,6 +8,9 @@ class ReSequenceWizard(models.TransientModel):
     _inherit = "account.resequence.wizard"
 
     def resequence(self):
+        # receiptbook logic only applies to payment moves
+        if not self.move_ids.receiptbook_id:
+            return super().resequence()
         if self.ordering == "keep":
             new_names = [v["new_by_name"] for v in json.loads(self[0]["new_values"]).values()]
         else:
@@ -43,3 +46,7 @@ class ReSequenceWizard(models.TransientModel):
             self[0].write({"new_values": json.dumps(filtered_moves)})
 
             super().resequence()
+
+        # Después de renumerar moves, los nombres de los account.payment quedan desfasados
+        # respecto a la ir.sequence del receiptbook: resyncronizamos el number_next.
+        original_move_ids.mapped("receiptbook_id").action_resync_sequence()

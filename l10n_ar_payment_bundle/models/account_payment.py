@@ -1,5 +1,6 @@
 from odoo import _, api, fields, models
 from odoo.exceptions import ValidationError
+from odoo.fields import Command
 
 
 class AccountPayment(models.Model):
@@ -34,6 +35,11 @@ class AccountPayment(models.Model):
     @api.onchange("is_main_payment")
     def _onchange_is_main_payment(self):
         self.filtered("is_main_payment").amount = 0
+
+    @api.onchange("company_id")
+    def _onchange_company_id(self):
+        if self.link_payment_ids:
+            self.link_payment_ids = [Command.clear()]
 
     @api.depends("link_payment_ids")
     def _compute_payment_total(self):
@@ -111,6 +117,15 @@ class AccountPayment(models.Model):
         if self.filtered(lambda x: x.is_main_payment and x.amount != 0):
             raise ValidationError(_("The payment bundle amount always must be Zero"))
 
+    @api.constrains("company_id", "main_payment_id", "link_payment_ids")
+    def _check_bundle_company_consistency(self):
+        for rec in self:
+            if rec.main_payment_id and rec.company_id != rec.main_payment_id.company_id:
+                raise ValidationError(_("The main payment and linked payment must belong to the same company."))
+
+            if rec.link_payment_ids.filtered(lambda p: p.company_id != rec.company_id):
+                raise ValidationError(_("The main payment and linked payments must belong to the same company."))
+
     @api.onchange("withholdings_amount")
     def _onchange_withholdings(self):
         main_payments = self.filtered("is_main_payment")
@@ -138,27 +153,68 @@ class AccountPayment(models.Model):
         return super()._select_bundle(bundles)
 
     def action_post(self):
-        if self.link_payment_ids and self.payment_method_code != "payment_bundle":
-            self.link_payment_ids.unlink()
+        for rec in self:
+            if rec.link_payment_ids and rec.payment_method_code != "payment_bundle":
+                rec.link_payment_ids.unlink()
 
-        if self.main_payment_id and not self.main_payment_id.name:
-            raise ValidationError(_("The main payment must have a name before a linked payment can be posted."))
+            if rec.main_payment_id and not rec.main_payment_id.name:
+                raise ValidationError(_("The main payment must have a name before a linked payment can be posted."))
 
         res = super(AccountPayment, self).action_post()
 
-        start_number = len(self.link_payment_ids.filtered(lambda x: x.name is not False))
-        for i, payment in enumerate(self.link_payment_ids, start=start_number):
-            if not payment.name:
-                payment.name = f"{self.name} ({i + 1})"
+        for rec in self:
+            start_number = len(rec.link_payment_ids.filtered(lambda x: x.name is not False))
+            for i, payment in enumerate(rec.link_payment_ids, start=start_number):
+                if not payment.name:
+                    payment.name = f"{rec.name} ({i + 1})"
 
-        draft_linked = self.link_payment_ids.filtered(lambda x: x.state == "draft")
+        draft_linked = self.filtered(lambda x: x.state != "draft").link_payment_ids.filtered(
+            lambda x: x.state == "draft"
+        )
         if draft_linked:
             draft_linked.action_post()
 
+        # Envío diferido del recibo del main: acá los vinculados ya imputaron, así el
+        # PDF sale con los comprobantes y no "A cuenta" (receiptbook lo saltea en el post).
+        self.filtered("is_main_payment")._send_receiptbook_mail()
+
+        return res
+
+    def _reconcile_after_post(self):
+        """Conciliamos las contrapartidas del bundle entre sí, además de contra la deuda.
+
+        El super concilia pago por pago: la contrapartida de cada pago contra las
+        to_pay_move_line_ids que todavía estén sin conciliar. Cuando una línea del bundle va
+        en sentido opuesto al resto (típico: el ajuste por redondeo, o un cheque rechazado que
+        se paga en el momento con efectivo), el primer pago cubre toda la deuda y queda con
+        residuo, y esa línea de sentido opuesto ya no encuentra deuda libre: sólo podía
+        compensarse contra el residuo del hermano, que no está en to_pay_move_line_ids. Queda
+        entonces una conciliación parcial con dos apuntes abiertos que netean cero.
+        """
+        res = super()._reconcile_after_post()
+        valid_account_types = self._get_valid_payment_account_types()
+        bundles = (self.mapped("main_payment_id") | self.filtered("is_main_payment")).filtered(
+            lambda x: x.company_id.use_payment_pro and not x.is_internal_transfer
+        )
+        for main in bundles:
+            amls = (main | main.link_payment_ids).move_id.line_ids.filtered(
+                lambda x: (
+                    not x.reconciled
+                    and x.move_id.state == "posted"
+                    and x.account_id.account_type in valid_account_types
+                )
+            )
+            for account in amls.account_id:
+                for partner in amls.partner_id:
+                    lines = amls.filtered(lambda x: x.account_id == account and x.partner_id == partner)
+                    residuals = lines.mapped("amount_residual")
+                    if any(residual > 0 for residual in residuals) and any(residual < 0 for residual in residuals):
+                        lines.reconcile()
         return res
 
     def action_draft(self):
-        res = super(AccountPayment, self + self.link_payment_ids).action_draft()
+        active_links = self.link_payment_ids.filtered(lambda p: p.state != "canceled")
+        res = super(AccountPayment, self + active_links).action_draft()
         if self.main_payment_id:
             return {
                 "type": "ir.actions.act_window",
@@ -309,7 +365,7 @@ class AccountPayment(models.Model):
             amount_payments = abs(amount_inbound + amount_outbound)
 
             rec.payment_difference = (
-                rec.main_payment_id.selected_debt
+                abs(rec.main_payment_id.to_pay_amount)
                 - amount_payments
                 - rec.main_payment_id.withholdings_amount
                 - rec.main_payment_id.write_off_amount

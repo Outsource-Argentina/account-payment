@@ -23,17 +23,30 @@ class AccountPaymentRegister(models.TransientModel):
     )
 
     @api.depends_context("uid")
-    # dummy depends para que se compute(no estamos seguros porque solo con el depends_context no computa)
-    @api.depends("journal_id")
     def _compute_requiere_account_cashbox_session(self):
-        self.requiere_account_cashbox_session = self.env.user.requiere_account_cashbox_session
+        for rec in self:
+            rec.requiere_account_cashbox_session = self.env.user.requiere_account_cashbox_session
 
+    @api.depends_context("uid")
+    @api.depends("journal_id", "company_id")
     def _compute_cashbox_session_id(self):
         for rec in self:
-            session_ids = self.env["account.cashbox.session"].search(
-                [("state", "=", "opened"), "|", ("user_ids", "=", self.env.uid), ("user_ids", "=", False)]
-            )
-            if len(session_ids) == 1:
+            # mismo criterio que en account.payment: la sesion tiene que ser de la compañia del
+            # pago y de una caja que maneje el diario
+            domain = [
+                ("state", "=", "opened"),
+                ("company_id", "=", rec.company_id.id),
+                "|",
+                ("user_ids", "=", self.env.uid),
+                ("user_ids", "=", False),
+            ]
+            if rec.journal_id:
+                domain += [("cashbox_id.journal_ids", "in", rec.journal_id.ids)]
+            session_ids = self.env["account.cashbox.session"].search(domain)
+            if rec.cashbox_session_id in session_ids:
+                # ya elegida y sigue siendo operable: no la pisamos (ver account.payment)
+                rec.cashbox_session_id = rec.cashbox_session_id
+            elif len(session_ids) == 1:
                 rec.cashbox_session_id = session_ids.id
             else:
                 rec.cashbox_session_id = False
