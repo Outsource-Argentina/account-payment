@@ -565,11 +565,11 @@ class AccountPayment(models.Model):
             payment_lines = rec.move_id.line_ids.filtered(lambda x: x.account_type in valid_payment_account_types)
             debit_moves = payment_lines.mapped("matched_debit_ids.debit_move_id")
             credit_moves = payment_lines.mapped("matched_credit_ids.credit_move_id")
-            debit_lines_sorted = debit_moves.filtered(lambda x: x.date_maturity != False).sorted(
-                key=lambda x: (x.date_maturity, x.move_id.name)
+            debit_lines_sorted = debit_moves.filtered(lambda x: x.date_maturity).sorted(
+                key=lambda x: (x.date_maturity, x.move_id.name or "")
             )
-            credit_lines_sorted = credit_moves.filtered(lambda x: x.date_maturity != False).sorted(
-                key=lambda x: (x.date_maturity, x.move_id.name)
+            credit_lines_sorted = credit_moves.filtered(lambda x: x.date_maturity).sorted(
+                key=lambda x: (x.date_maturity, x.move_id.name or "")
             )
             debit_lines_without_date_maturity = debit_moves - debit_lines_sorted
             credit_lines_without_date_maturity = credit_moves - credit_lines_sorted
@@ -771,6 +771,27 @@ class AccountPayment(models.Model):
                     % (rec.partner_id.name, to_pay_partners.name)
                 )
 
+    def _get_debt_lines_covered(self, counterpart_aml, debt_aml):
+        """Return the debt lines that the core reconciliation would actually match."""
+        amls = (counterpart_aml + debt_aml).with_context(
+            no_exchange_difference=self.env.context.get("no_exchange_difference")
+            or bool(self.env["ir.config_parameter"].sudo().get_param("account.disable_partial_exchange_diff"))
+        )
+        plan_list, all_amls = amls._optimize_reconciliation_plan([amls])
+        values_map = {
+            aml: {
+                "aml": aml,
+                "amount_residual": aml.amount_residual,
+                "amount_residual_currency": aml.amount_residual_currency,
+            }
+            for aml in all_amls
+        }
+        matched_ids = set()
+        for plan in plan_list:
+            for res in amls._prepare_reconciliation_plan(plan, values_map):
+                matched_ids.update((res["partial_values"]["debit_move_id"], res["partial_values"]["credit_move_id"]))
+        return debt_aml.filtered(lambda l: l.id in matched_ids)
+
     def _reconcile_after_post(self):
         to_reconcile = self.filtered(lambda x: x.company_id.use_payment_pro and not x.is_internal_transfer)
         # El pago con tarjeta de crédito llega a 'paid' con el asiento en borrador (el core no lo
@@ -788,6 +809,7 @@ class AccountPayment(models.Model):
                 lambda r: not r.reconciled and r.account_id.id == counterpart_aml.account_id.id
             )
             if counterpart_aml and debt_aml:
+                debt_aml = self._get_debt_lines_covered(counterpart_aml, debt_aml)
                 (counterpart_aml + (debt_aml)).reconcile()
             # Lo sacamos ya que no es correcto de odoo cuando se deslinkea el pago
             # o se linkea por otro lado el pago no lo suma. Decidimos dejarlo por si surge la necesidad
@@ -797,9 +819,12 @@ class AccountPayment(models.Model):
             #         invoices.matched_payment_ids += rec
 
     def action_post(self):
-        res = super().action_post()
-        self._check_to_pay_lines_account()
-        self._reconcile_after_post()
+        # The list view "Post Payments" action calls this on every selected payment, and the core sets
+        # the ones with a cash outstanding account to paid whatever their state. Canceled ones are skipped.
+        to_post = self.filtered(lambda x: x.state != "canceled")
+        res = super(AccountPayment, to_post).action_post()
+        to_post._check_to_pay_lines_account()
+        to_post._reconcile_after_post()
         return res
 
     def _get_mached_payment(self):

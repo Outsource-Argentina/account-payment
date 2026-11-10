@@ -7,9 +7,10 @@ from odoo.exceptions import ValidationError
 class AccountPayment(models.Model):
     _inherit = "account.payment"
 
+    # No default on purpose: this field means "when this operation was confirmed", so it stays
+    # empty while the payment is a draft and it is filled on the first action_post().
     l10n_latam_move_check_ids_operation_date = fields.Datetime(
         string="Operation Date",
-        default=fields.Datetime.now,
     )
 
     @api.constrains("l10n_latam_move_check_ids_operation_date", "state")
@@ -40,31 +41,72 @@ class AccountPayment(models.Model):
         for rec in self:
             if rec.l10n_latam_check_warning_msg:
                 raise ValidationError("%s" % rec.l10n_latam_check_warning_msg)
-            rec.l10n_latam_move_check_ids_operation_date = rec._get_check_operation_date()
-        super().action_post()
+            # The chain of a check is the order in which its operations were confirmed, not the
+            # order in which they were created: a payment order left in draft for a few days and
+            # confirmed last belongs at the end of the chain, otherwise the check it hands over
+            # keeps showing as available in the portfolio.
+            # Recomputing it on every confirmation does not reorder anything, because action_draft
+            # only lets the last operation of the chain go back to draft.
+            # action_post can also run on payments that are already confirmed (e.g. the list view
+            # confirm action), so only drafts get a new date.
+            if rec.state == "draft":
+                rec.l10n_latam_move_check_ids_operation_date = rec._get_check_operation_date()
+        # The core unlinks the checks of payments whose method is not for checks, and a bank journal
+        # cannot have a checks method. The inbound leg of a check transfer (its paired payment moves
+        # the same checks) keeps them anyway, on every confirmation and not only on the wizard one.
+        # A payment that kept stale checks after a method change has no such paired payment.
+        # The inbound legs go last: posting one moves the check to its journal, and an outbound leg
+        # posted in the same batch would then fail its "check still in journal" validation.
+        inbound_legs = self.filtered(
+            lambda x: (
+                x.payment_type == "inbound"
+                and x.l10n_latam_move_check_ids
+                and x.l10n_latam_move_check_ids == x.paired_internal_transfer_payment_id.l10n_latam_move_check_ids
+            )
+        )
+        others = self - inbound_legs
+        if others:
+            super(AccountPayment, others).action_post()
+        if inbound_legs:
+            super(AccountPayment, inbound_legs.with_context(l10n_ar_skip_remove_check=True)).action_post()
 
     def _get_check_operation_date(self):
-        """Fecha que deja a este pago al final de la cadena de operaciones de sus cheques.
+        """Confirmation date that leaves this payment last in the chain of its checks.
 
-        El orden de la cadena de un cheque —quien es su "ultima operacion"— sale de
-        ``l10n_latam_move_check_ids_operation_date``, y de ahi dependen el diario actual del cheque
-        (``_compute_current_journal``) y el bloqueo para restablecer un pago a borrador
-        (``action_draft``).
-
-        Anclar ese valor a una fecha suelta ordena mal en los dos sentidos: con la fecha de
-        confirmacion, re-confirmar un pago viejo lo manda al final de la cadena; con la fecha de
-        creacion, un borrador creado antes que el resto queda al principio aunque se confirme
-        ultimo, y ahi el cheque entregado sigue figurando en cartera. Por eso partimos de
-        ``create_date`` pero garantizamos que confirmar nunca deje al pago antes de una operacion
-        ya confirmada del mismo cheque.
+        The date has second precision, so two confirmations in the same second tie, and the id
+        tie-break follows the creation order: a payment order drafted before the receipt would land
+        first again. Pushing it one second past the last confirmed operation keeps the chain strict.
         """
         self.ensure_one()
-        operation_date = self.create_date or fields.Datetime.now()
-        for check in self.l10n_latam_move_check_ids | self.l10n_latam_new_check_ids:
+        return self._get_checks_operation_date(self.l10n_latam_move_check_ids | self.l10n_latam_new_check_ids)
+
+    @api.model
+    def _get_checks_operation_date(self, checks):
+        operation_date = fields.Datetime.now()
+        for check in checks:
             last_operation_date = check._get_last_operation().l10n_latam_move_check_ids_operation_date
             if last_operation_date:
                 operation_date = max(operation_date, last_operation_date + timedelta(seconds=1))
         return operation_date
+
+    def _is_check_transfer(self):
+        return self.payment_method_code in ("out_third_party_checks", "return_third_party_checks")
+
+    @api.depends("payment_method_line_id")
+    def _compute_available_destination_payment_method_line_ids(self):
+        super()._compute_available_destination_payment_method_line_ids()
+        for pay in self.filtered("available_destination_payment_method_line_ids"):
+            if pay._is_check_transfer():
+                pay.available_destination_payment_method_line_ids = (
+                    pay.destination_journal_id._get_check_transfer_destination_lines()
+                )
+            else:
+                # a transfer never brings new checks: with that line the paired payment ends up with amount 0
+                pay.available_destination_payment_method_line_ids = (
+                    pay.available_destination_payment_method_line_ids.filtered(
+                        lambda x: x.code != "new_third_party_checks"
+                    )
+                )
 
     def _create_paired_internal_transfer_payment(self):
         """
@@ -108,20 +150,21 @@ class AccountPayment(models.Model):
                         ),
                     )._create_paired_internal_transfer_payment()
 
-                rec.write(
-                    {
-                        "l10n_latam_move_check_ids_operation_date": rec.l10n_latam_move_check_ids_operation_date
-                        - timedelta(seconds=1)
-                    }
-                )
+                # The paired payment is created with copy(), so it inherits this operation date
+                # and is the counterpart of the same operation. It does not need its own date
+                # pushed forward: the id tie-break leaves it last, and the check ends up in the
+                # destination journal.
                 rec._get_latam_checks()._compute_current_journal()
                 rec._get_latam_checks()._compute_company_id()
 
                 # If the journal belongs to the third-party checks journal, posting the move was incorrectly removing the checks,
                 # even though the payment method line is for checks.
                 # To fix this, we replicate the same behavior as in Odoo's "transfer check" wizard by setting the proper payment method.
-                correct_dest_payment_method = rec.destination_journal_id.inbound_payment_method_line_ids.filtered(
-                    lambda x: x.code == "in_third_party_checks"
+                # An explicit choice by the user wins over this default.
+                correct_dest_payment_method = rec.destination_payment_method_line_id or (
+                    rec.destination_journal_id.inbound_payment_method_line_ids.filtered(
+                        lambda x: x.code == "in_third_party_checks"
+                    )
                 )
                 if correct_dest_payment_method:
                     rec.paired_internal_transfer_payment_id.payment_method_line_id = correct_dest_payment_method
@@ -146,12 +189,24 @@ class AccountPayment(models.Model):
         return super(AccountPayment, payments_with_reconciled_checks)._get_reconciled_checks_error()
 
     def action_draft(self):
+        # Only a confirmed operation after this payment blocks it. A canceled payment is out of the
+        # chain, so the last operation can be an earlier one, and a payment canceled without ever
+        # being confirmed has no operation date and never blocks.
         for rec in self:
+            if not rec.l10n_latam_move_check_ids_operation_date:
+                continue
+            rec_key = (rec.l10n_latam_move_check_ids_operation_date, rec._origin.id)
             for check in rec.mapped("l10n_latam_move_check_ids") + rec.mapped("l10n_latam_new_check_ids"):
                 last_operation = check._get_last_operation()
-                if rec != last_operation:
+                if (
+                    last_operation
+                    and rec != last_operation
+                    and (last_operation.l10n_latam_move_check_ids_operation_date, last_operation._origin.id) > rec_key
+                ):
                     raise ValidationError(
-                        "You cannot reset this operation to draft because it is not the last operation for the checks."
+                        self.env._(
+                            "You cannot reset this operation to draft because it is not the last operation for the checks."
+                        )
                     )
 
         super().action_draft()
